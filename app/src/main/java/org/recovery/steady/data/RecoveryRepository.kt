@@ -1,6 +1,7 @@
 package org.recovery.steady.data
 
 import android.content.Context
+import android.util.Log
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
@@ -11,10 +12,10 @@ import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -63,6 +64,8 @@ class RecoveryRepository(private val context: Context) {
                     sourceUrl = prefs[DAILY_SCRIPTURE_SOURCE].orEmpty(),
                 )
             },
+            motivationalQuotes = decodeMotivationalQuotes(prefs[MOTIVATIONAL_QUOTES_CACHE]),
+            initialSetupComplete = prefs[INITIAL_SETUP_COMPLETE] ?: false,
         )
     }
 
@@ -76,6 +79,12 @@ class RecoveryRepository(private val context: Context) {
         refreshSignal.value += 1
     }
 
+    suspend fun completeInitialSetup(startedAtMillis: Long) = withContext(Dispatchers.IO) {
+        database.updateCurrentStart(startedAtMillis)
+        context.settingsDataStore.edit { it[INITIAL_SETUP_COMPLETE] = true }
+        refreshSignal.value += 1
+    }
+
     suspend fun deleteLapse(id: Long) = withContext(Dispatchers.IO) {
         database.deleteLapse(id)
         refreshSignal.value += 1
@@ -84,6 +93,43 @@ class RecoveryRepository(private val context: Context) {
     suspend fun saveSharedResource(text: String) = withContext(Dispatchers.IO) {
         database.saveSharedResource(text)
         refreshSignal.value += 1
+    }
+
+    suspend fun deleteResource(id: Long) = withContext(Dispatchers.IO) {
+        database.deleteResource(id)
+        refreshSignal.value += 1
+    }
+
+    suspend fun exportBackup(): String = withContext(Dispatchers.IO) {
+        val preferences = appPreferences.first()
+        BackupCodec.encode(
+            AppBackup(
+                recovery = database.currentState(),
+                lapses = database.lapses(),
+                resources = database.resources(),
+                reminder = reminderSettings.first(),
+                themeColorId = preferences.themeColorId,
+                goals = preferences.goals,
+            ),
+        )
+    }
+
+    suspend fun importBackup(value: String): AppBackup = withContext(Dispatchers.IO) {
+        val backup = BackupCodec.decode(value)
+        database.replaceAll(backup)
+        context.settingsDataStore.edit { prefs ->
+            prefs[REMINDER_ENABLED] = backup.reminder.enabled
+            prefs[REMINDER_HOUR] = backup.reminder.hour
+            prefs[REMINDER_MINUTE] = backup.reminder.minute
+            prefs[THEME_COLOR] = backup.themeColorId
+            prefs[GOAL_IDS] = backup.goals.enabledGoalIds
+            prefs[GOAL_NOTIFICATIONS] = backup.goals.notificationsEnabled
+            prefs[LAST_GOAL_START] = backup.goals.lastNotifiedStartMillis
+            prefs[LAST_GOAL_ID] = backup.goals.lastNotifiedGoalId
+            prefs[INITIAL_SETUP_COMPLETE] = true
+        }
+        refreshSignal.value += 1
+        backup
     }
 
     suspend fun updateReminder(settings: ReminderSettings) {
@@ -111,6 +157,8 @@ class RecoveryRepository(private val context: Context) {
 
     suspend fun preferencesSnapshot(): AppPreferences = appPreferences.first()
 
+    suspend fun reminderSnapshot(): ReminderSettings = reminderSettings.first()
+
     suspend fun markGoalNotified(startedAtMillis: Long, goalId: String) {
         context.settingsDataStore.edit { prefs ->
             prefs[LAST_GOAL_START] = startedAtMillis
@@ -121,7 +169,7 @@ class RecoveryRepository(private val context: Context) {
     suspend fun refreshDailyScriptureIfNeeded() = withContext(Dispatchers.IO) {
         val today = LocalDate.now().toString()
         val current = appPreferences.first().dailyScripture
-        if (current?.fetchedDate == today && current.text.isNotBlank()) return@withContext
+        if ((current?.fetchedDate == today) && current.text.isNotBlank()) return@withContext
 
         val selection = DAILY_SCRIPTURES[Math.floorMod(LocalDate.now().toEpochDay(), DAILY_SCRIPTURES.size.toLong()).toInt()]
         runCatching {
@@ -130,9 +178,9 @@ class RecoveryRepository(private val context: Context) {
             connection.connectTimeout = 8_000
             connection.readTimeout = 8_000
             connection.setRequestProperty("Accept", "application/json")
-            connection.setRequestProperty("User-Agent", "Steady-Android/0.3")
+            connection.setRequestProperty("User-Agent", "FromGraceToGrace-Android/0.3")
             try {
-                if (connection.responseCode !in 200..299) error("Scripture API returned ${connection.responseCode}")
+                if ((connection.responseCode !in 200..299)) error("Scripture API returned ${connection.responseCode}")
                 val json = JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
                 DailyScripture(
                     text = json.getString("text").trim(),
@@ -153,6 +201,61 @@ class RecoveryRepository(private val context: Context) {
         }
     }
 
+    suspend fun refreshMotivationalQuotesIfNeeded() = withContext(Dispatchers.IO) {
+        val today = LocalDate.now().toEpochDay()
+        val prefs = context.settingsDataStore.data.first()
+        val lastSuccess = prefs[MOTIVATIONAL_QUOTES_LAST_SUCCESS_DAY]
+        if (lastSuccess != null && today - lastSuccess < QUOTE_REFRESH_DAYS) {
+            return@withContext
+        }
+
+        val result = runCatching {
+            val connection = URL(MOTIVATIONAL_QUOTES_API).openConnection() as HttpURLConnection
+            connection.connectTimeout = 8_000
+            connection.readTimeout = 8_000
+            connection.setRequestProperty("Accept", "application/json")
+            connection.setRequestProperty("User-Agent", "FromGraceToGrace-Android/0.3")
+            try {
+                if (connection.responseCode !in 200..299) {
+                    error("Quote API returned ${connection.responseCode}")
+                }
+                val response = JSONArray(connection.inputStream.bufferedReader().use { it.readText() })
+                buildList {
+                    for (index in 0 until response.length()) {
+                        val item = response.optJSONObject(index) ?: continue
+                        val text = item.optString("q").trim()
+                        val author = item.optString("a").trim()
+                        if (
+                            text.isNotBlank() &&
+                            author.isNotBlank() &&
+                            author.lowercase() != "zenquotes.io" &&
+                            isSuitableForRecoveryFeed(text) &&
+                            text.length <= MAX_QUOTE_LENGTH
+                        ) {
+                            add(MotivationalQuote(text, author))
+                        }
+                    }
+                }.distinctBy { it.text }
+            } finally {
+                connection.disconnect()
+            }
+        }
+
+        val quotes = result.getOrElse { error ->
+            Log.w(QUOTE_LOG_TAG, "Motivational quote refresh failed", error)
+            return@withContext
+        }
+        if (quotes.isEmpty()) {
+            Log.w(QUOTE_LOG_TAG, "Quote service returned no suitable quotes.")
+            return@withContext
+        }
+
+        context.settingsDataStore.edit { settings ->
+            settings[MOTIVATIONAL_QUOTES_CACHE] = encodeMotivationalQuotes(quotes)
+            settings[MOTIVATIONAL_QUOTES_LAST_SUCCESS_DAY] = today
+        }
+    }
+
     companion object {
         private val REMINDER_ENABLED = booleanPreferencesKey("reminder_enabled")
         private val REMINDER_HOUR = intPreferencesKey("reminder_hour")
@@ -166,9 +269,63 @@ class RecoveryRepository(private val context: Context) {
         private val DAILY_SCRIPTURE_REFERENCE = stringPreferencesKey("daily_scripture_reference")
         private val DAILY_SCRIPTURE_DATE = stringPreferencesKey("daily_scripture_date")
         private val DAILY_SCRIPTURE_SOURCE = stringPreferencesKey("daily_scripture_source")
+        private val MOTIVATIONAL_QUOTES_CACHE = stringPreferencesKey("motivational_quotes_cache")
+        private val MOTIVATIONAL_QUOTES_LAST_SUCCESS_DAY =
+            longPreferencesKey("motivational_quotes_last_success_day")
+        private val INITIAL_SETUP_COMPLETE = booleanPreferencesKey("initial_setup_complete")
 
         private const val SCRIPTURE_API_BASE =
             "https://openscriptureapi.org/api/scriptures/v1/lds/en/book"
+        private const val MOTIVATIONAL_QUOTES_API =
+            "https://zenquotes.io/api/quotes"
+        private const val QUOTE_REFRESH_DAYS = 7L
+        private const val MAX_QUOTE_LENGTH = 180
+        private const val QUOTE_LOG_TAG = "QuoteRefresh"
+
+        private val RECOVERY_SENSITIVE_TERMS = listOf(
+            "alcohol",
+            "dead",
+            "death",
+            "die",
+            "drug",
+            "enemy",
+            "enemies",
+            "kill",
+            "suicide",
+        )
+
+        private fun isSuitableForRecoveryFeed(text: String): Boolean {
+            val words = text.lowercase()
+                .replace(Regex("[^a-z]+"), " ")
+                .trim()
+                .split(" ")
+                .toSet()
+            return RECOVERY_SENSITIVE_TERMS.none(words::contains)
+        }
+
+        private fun encodeMotivationalQuotes(quotes: List<MotivationalQuote>): String =
+            JSONArray().apply {
+                quotes.forEach { quote ->
+                    put(JSONObject().put("text", quote.text).put("author", quote.author))
+                }
+            }.toString()
+
+        private fun decodeMotivationalQuotes(value: String?): List<MotivationalQuote> {
+            if (value.isNullOrBlank()) return emptyList()
+            return runCatching {
+                val array = JSONArray(value)
+                buildList {
+                    for (index in 0 until array.length()) {
+                        val item = array.optJSONObject(index) ?: continue
+                        val text = item.optString("text").trim()
+                        val author = item.optString("author").trim()
+                        if (text.isNotBlank() && author.isNotBlank()) {
+                            add(MotivationalQuote(text, author))
+                        }
+                    }
+                }
+            }.getOrDefault(emptyList())
+        }
 
         private data class ScriptureSelection(
             val book: String,

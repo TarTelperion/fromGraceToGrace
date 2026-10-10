@@ -1,9 +1,5 @@
 package org.recovery.steady.domain
 
-import java.time.Instant
-import java.time.ZoneId
-import java.time.temporal.ChronoUnit
-
 data class RecoveryDuration(
     val completedDays: Long,
     val hoursAfterLastDay: Long,
@@ -12,17 +8,15 @@ data class RecoveryDuration(
 fun calculateRecoveryDuration(
     startedAtMillis: Long,
     nowMillis: Long,
-    zoneId: ZoneId = ZoneId.systemDefault(),
 ): RecoveryDuration {
-    val start = Instant.ofEpochMilli(startedAtMillis)
-    val now = Instant.ofEpochMilli(nowMillis.coerceAtLeast(startedAtMillis))
-    val startDate = start.atZone(zoneId).toLocalDate()
-    val nowDate = now.atZone(zoneId).toLocalDate()
-    val calendarDays = ChronoUnit.DAYS.between(startDate, nowDate).coerceAtLeast(0)
-    val totalHours = ChronoUnit.HOURS.between(start, now).coerceAtLeast(0)
+    val elapsedMillis = (nowMillis - startedAtMillis).coerceAtLeast(0L)
+    val totalHours = elapsedMillis / MILLIS_PER_HOUR
+    val completedDays = totalHours / HOURS_PER_DAY
     return RecoveryDuration(
-        completedDays = calendarDays,
-        hoursAfterLastDay = (totalHours - calendarDays * 24).coerceAtLeast(0),
+        completedDays = completedDays,
+        hoursAfterLastDay = totalHours % HOURS_PER_DAY,
     )
 }
 
+private const val HOURS_PER_DAY = 24L
+private const val MILLIS_PER_HOUR = 60L * 60L * 1_000L

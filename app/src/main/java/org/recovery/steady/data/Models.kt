@@ -50,6 +50,17 @@ data class AppPreferences(
     val themeColorId: String = "sage",
     val goals: GoalSettings = GoalSettings(),
     val dailyScripture: DailyScripture? = null,
+    val motivationalQuotes: List<MotivationalQuote> = emptyList(),
+    val initialSetupComplete: Boolean = false,
+)
+
+data class AppBackup(
+    val recovery: RecoveryState,
+    val lapses: List<LapseRecord>,
+    val resources: List<SavedResource>,
+    val reminder: ReminderSettings,
+    val themeColorId: String,
+    val goals: GoalSettings,
 )
 
 data class DailyScripture(
@@ -57,4 +68,9 @@ data class DailyScripture(
     val reference: String,
     val fetchedDate: String,
     val sourceUrl: String,
+)
+
+data class MotivationalQuote(
+    val text: String,
+    val author: String,
 )

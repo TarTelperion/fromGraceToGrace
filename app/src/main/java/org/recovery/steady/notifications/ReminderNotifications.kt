@@ -12,10 +12,8 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.work.CoroutineWorker
-import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import org.recovery.steady.MainActivity
@@ -57,10 +55,10 @@ object ReminderNotifications {
         var next = now.withHour(settings.hour).withMinute(settings.minute).withSecond(0).withNano(0)
         if (!next.isAfter(now)) next = next.plusDays(1)
         val delay = Duration.between(now, next)
-        val request = PeriodicWorkRequestBuilder<ReminderWorker>(24, TimeUnit.HOURS)
+        val request = OneTimeWorkRequestBuilder<ReminderWorker>()
             .setInitialDelay(delay.toMinutes(), TimeUnit.MINUTES)
             .build()
-        manager.enqueueUniquePeriodicWork(WORK_NAME, ExistingPeriodicWorkPolicy.UPDATE, request)
+        manager.enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.REPLACE, request)
     }
 }
 
@@ -96,10 +94,10 @@ object GoalNotifications {
 
         val elapsed = (System.currentTimeMillis() - recovery.startedAtMillis).coerceAtLeast(0L)
         val reached = enabledGoals.lastOrNull { elapsed >= it.durationMillis }
-        val reachedAlreadyNotified = reached != null &&
-            settings.lastNotifiedStartMillis == recovery.startedAtMillis &&
-            settings.lastNotifiedGoalId == reached.id
-        val delayMillis = if (reached != null && !reachedAlreadyNotified) {
+        val reachedAlreadyNotified = (reached != null) &&
+            (settings.lastNotifiedStartMillis == recovery.startedAtMillis) &&
+            (settings.lastNotifiedGoalId == reached.id)
+        val delayMillis = if ((reached != null) && !reachedAlreadyNotified) {
             0L
         } else {
             val next = enabledGoals.firstOrNull { elapsed < it.durationMillis }
@@ -130,15 +128,14 @@ class GoalWorker(
 
         val elapsed = (System.currentTimeMillis() - recovery.startedAtMillis).coerceAtLeast(0L)
         val reached = SobrietyGoal.entries
-            .filter { it.id in settings.enabledGoalIds }
-            .lastOrNull { elapsed >= it.durationMillis }
+            .lastOrNull { (it.id in settings.enabledGoalIds) && (elapsed >= it.durationMillis) }
         if (reached == null) {
             GoalNotifications.schedule(applicationContext, recovery, settings)
             return Result.success()
         }
 
-        val alreadyNotified = settings.lastNotifiedStartMillis == recovery.startedAtMillis &&
-            settings.lastNotifiedGoalId == reached.id
+        val alreadyNotified = (settings.lastNotifiedStartMillis == recovery.startedAtMillis) &&
+            (settings.lastNotifiedGoalId == reached.id)
         if (!alreadyNotified) {
             val intent = Intent(applicationContext, MainActivity::class.java)
             val pendingIntent = PendingIntent.getActivity(
@@ -147,7 +144,7 @@ class GoalWorker(
                 intent,
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
-            val message = "You reached ${reached.label}. Keep choosing the next steady step."
+            val message = "You reached ${reached.label}. Keep moving forward, grace to grace."
             val notification = NotificationCompat.Builder(applicationContext, GoalNotifications.CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_app)
                 .setContentTitle("A milestone reached")
@@ -169,20 +166,22 @@ class GoalWorker(
 }
 
 private fun canPostNotifications(context: Context): Boolean =
-    Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
-        PackageManager.PERMISSION_GRANTED
+    (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) ||
+        (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
+        PackageManager.PERMISSION_GRANTED)
 
 class ReminderWorker(
     appContext: Context,
     params: WorkerParameters,
 ) : CoroutineWorker(appContext, params) {
     override suspend fun doWork(): Result {
+        val repository = RecoveryRepository(applicationContext)
         if (
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.POST_NOTIFICATIONS) !=
-            PackageManager.PERMISSION_GRANTED
+            (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) &&
+            (ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED)
         ) {
+            ReminderNotifications.schedule(applicationContext, repository.reminderSnapshot())
             return Result.success()
         }
 
@@ -205,6 +204,7 @@ class ReminderWorker(
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .build()
         NotificationManagerCompat.from(applicationContext).notify(1001, notification)
+        ReminderNotifications.schedule(applicationContext, repository.reminderSnapshot())
         return Result.success()
     }
 

@@ -6,6 +6,8 @@ import android.app.TimePickerDialog
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import androidx.core.net.toUri
+import kotlin.time.Duration.Companion.seconds
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -57,6 +59,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -77,6 +80,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.recovery.steady.data.LapseRecord
 import org.recovery.steady.data.GoalSettings
+import org.recovery.steady.data.MotivationalQuote
 import org.recovery.steady.data.ReminderSettings
 import org.recovery.steady.domain.calculateRecoveryDuration
 import org.recovery.steady.domain.calculateGoalProgress
@@ -87,6 +91,7 @@ import org.recovery.steady.ui.SteadyTheme
 import org.recovery.steady.ui.ThemeColor
 import kotlinx.coroutines.delay
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
@@ -112,9 +117,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleShare(intent: Intent?) {
-        if (intent?.action != Intent.ACTION_SEND || intent.type != "text/plain") return
+        if ((intent?.action != Intent.ACTION_SEND) || (intent.type != "text/plain")) return
         val text = intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty()
         if (text.isNotBlank()) viewModel.importSharedText(text)
+        intent.action = null
+        intent.removeExtra(Intent.EXTRA_TEXT)
     }
 }
 
@@ -128,6 +135,7 @@ private enum class AppTab(val label: String) {
 @Composable
 private fun SteadyApp(state: AppState, viewModel: AppViewModel) {
     var tab by remember { mutableStateOf(AppTab.HOME) }
+    val backupStatus by viewModel.backupStatus.collectAsStateWithLifecycle()
     Scaffold(
         bottomBar = {
             NavigationBar(
@@ -170,7 +178,7 @@ private fun SteadyApp(state: AppState, viewModel: AppViewModel) {
                     onSetStart = viewModel::updateCurrentStart,
                     onOpenFeed = { tab = AppTab.FEED },
                 )
-                AppTab.FEED -> FeedScreen(state)
+                AppTab.FEED -> FeedScreen(state, viewModel::deleteResource)
                 AppTab.HISTORY -> HistoryScreen(state.lapses, viewModel::deleteLapse)
                 AppTab.SETTINGS -> SettingsScreen(
                     reminder = state.reminder,
@@ -179,10 +187,48 @@ private fun SteadyApp(state: AppState, viewModel: AppViewModel) {
                     onUpdateReminder = viewModel::updateReminder,
                     onUpdateGoals = viewModel::updateGoals,
                     onUpdateTheme = viewModel::updateThemeColor,
+                    onExportBackup = viewModel::exportBackup,
+                    onImportBackup = viewModel::importBackup,
+                    backupStatus = backupStatus,
+                    onClearBackupStatus = viewModel::clearBackupStatus,
                 )
             }
         }
     }
+
+    if ((state.recovery != null) && !state.preferences.initialSetupComplete) {
+        InitialSetupDialog(onComplete = viewModel::completeInitialSetup)
+    }
+}
+
+@Composable
+private fun InitialSetupDialog(onComplete: (Long) -> Unit) {
+    val context = LocalContext.current
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text("Welcome to From Grace to Grace") },
+        text = {
+            Text("When did your current start begin? This sets your day count and your first goal. You can adjust it later.")
+        },
+        confirmButton = {
+            Button(onClick = { onComplete(System.currentTimeMillis()) }) {
+                Text("Start now")
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = {
+                    showStartDateTimePicker(
+                        context = context,
+                        currentMillis = System.currentTimeMillis(),
+                        onSelected = onComplete,
+                    )
+                },
+            ) {
+                Text("Choose date and time")
+            }
+        },
+    )
 }
 
 @Composable
@@ -194,10 +240,10 @@ private fun HomeScreen(
 ) {
     val context = LocalContext.current
     var showDialog by remember { mutableStateOf(false) }
-    var nowMillis by remember { mutableStateOf(System.currentTimeMillis()) }
+    var nowMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) {
         while (true) {
-            delay(30_000)
+            delay(30.seconds)
             nowMillis = System.currentTimeMillis()
         }
     }
@@ -218,7 +264,18 @@ private fun HomeScreen(
     ) {
         item { Spacer(Modifier.height(18.dp)) }
         item {
-            Text("One day at a time", style = MaterialTheme.typography.titleMedium)
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(
+                    "“And he received not of the fulness at first, but continued from grace to grace, until he received a fulness.”",
+                    style = MaterialTheme.typography.titleMedium,
+                    textAlign = TextAlign.Center,
+                )
+                Text(
+                    "Doctrine and Covenants 93:13",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
         }
         item { DayCircle(days, startLabel, goalProgress?.fraction ?: 0f) }
         item {
@@ -346,15 +403,14 @@ private fun RecordLapseDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit
 }
 
 @Composable
-private fun FeedScreen(state: AppState) {
+private fun FeedScreen(state: AppState, onDeleteResource: (Long) -> Unit) {
     val context = LocalContext.current
-    val builtIn = listOf(
-        "Take one small step. You do not have to solve the whole day at once.",
-        "A difficult moment does not cancel the progress that came before it.",
-        "Reach outward instead of withdrawing. Connection can interrupt the pattern.",
-        "Be honest without being cruel to yourself.",
-        "Rest, food, movement, prayer, and conversation are practical forms of care.",
-    )
+    var pendingResourceDelete by remember { mutableStateOf<org.recovery.steady.data.SavedResource?>(null) }
+    val quoteDay = rememberDailyEpochDay()
+    val dailyQuotes = remember(state.preferences.motivationalQuotes, quoteDay) {
+        quotesForDay(CURATED_QUOTES, quoteDay, 2) +
+            quotesForDay(state.preferences.motivationalQuotes, quoteDay, 3)
+    }
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -381,48 +437,105 @@ private fun FeedScreen(state: AppState) {
                     onOpen = { context.openUrl(scripture.sourceUrl) },
                 )
             }
-            item {
-                Text(
-                    "Updated daily from the community-run Open Scripture API and cached for offline use.",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
         }
         items(state.resources, key = { "saved-${it.id}" }) { resource ->
             ResourceLinkCard(
                 title = resource.title,
                 body = resource.body,
                 onOpen = resource.sourceUrl?.let { url -> { context.openUrl(url) } },
+                onDelete = { pendingResourceDelete = resource },
             )
         }
-        items(builtIn) { EncouragementCard(it) }
+        items(dailyQuotes, key = { "quote-${it.author}-${it.text}" }) { quote ->
+            EncouragementCard(quote.text, quote.author)
+        }
+        if (state.preferences.motivationalQuotes.isNotEmpty()) {
+            item {
+                TextButton(onClick = { context.openUrl(ZEN_QUOTES_URL) }) {
+                    Text("Inspirational quotes provided by ZenQuotes")
+                }
+            }
+        }
         item { Spacer(Modifier.height(20.dp)) }
     }
-}
 
-@Composable
-private fun EncouragementCard(text: String) {
-    Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
-        shape = RoundedCornerShape(22.dp),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Text(
-            text,
-            style = MaterialTheme.typography.titleMedium,
-            modifier = Modifier.padding(22.dp),
+    pendingResourceDelete?.let { resource ->
+        AlertDialog(
+            onDismissRequest = { pendingResourceDelete = null },
+            title = { Text("Remove saved passage?") },
+            text = { Text("This removes the passage from this phone. It will not affect the original source.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onDeleteResource(resource.id)
+                        pendingResourceDelete = null
+                    },
+                ) { Text("Remove") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingResourceDelete = null }) { Text("Cancel") }
+            },
         )
     }
 }
 
 @Composable
-private fun ResourceLinkCard(title: String, body: String, onOpen: (() -> Unit)?) {
+private fun EncouragementCard(text: String, author: String? = null) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+        shape = RoundedCornerShape(22.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(22.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(text, style = MaterialTheme.typography.titleMedium)
+            if (!author.isNullOrBlank()) {
+                Text("— $author", style = MaterialTheme.typography.bodyMedium)
+            }
+        }
+    }
+}
+
+@Composable
+private fun rememberDailyEpochDay(): Long {
+    var epochDay by remember { mutableLongStateOf(LocalDate.now().toEpochDay()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            val now = ZonedDateTime.now()
+            val nextMidnight = now.toLocalDate().plusDays(1).atStartOfDay(now.zone)
+            val millis = java.time.Duration.between(now, nextMidnight).toMillis().coerceAtLeast(1_000L)
+            delay(millis)
+            epochDay = LocalDate.now().toEpochDay()
+        }
+    }
+    return epochDay
+}
+
+private fun quotesForDay(
+    quotes: List<MotivationalQuote>,
+    epochDay: Long,
+    count: Int = 5,
+): List<MotivationalQuote> {
+    if (quotes.isEmpty()) return emptyList()
+    val start = Math.floorMod(epochDay, quotes.size.toLong()).toInt()
+    return List(minOf(count, quotes.size)) { offset -> quotes[(start + offset) % quotes.size] }
+}
+
+@Composable
+private fun ResourceLinkCard(
+    title: String,
+    body: String,
+    onOpen: (() -> Unit)?,
+    onDelete: (() -> Unit)? = null,
+) {
     Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp)) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Text(body, style = MaterialTheme.typography.bodyMedium)
             if (onOpen != null) {
                 TextButton(onClick = onOpen) { Text("Open source") }
+            }
+            if (onDelete != null) {
+                TextButton(onClick = onDelete) { Text("Remove saved passage") }
             }
         }
     }
@@ -488,6 +601,10 @@ private fun SettingsScreen(
     onUpdateReminder: (ReminderSettings) -> Unit,
     onUpdateGoals: (GoalSettings) -> Unit,
     onUpdateTheme: (String) -> Unit,
+    onExportBackup: (Uri) -> Unit,
+    onImportBackup: (Uri) -> Unit,
+    backupStatus: String?,
+    onClearBackupStatus: () -> Unit,
 ) {
     val context = LocalContext.current
     val reminderPermissionLauncher = rememberLauncherForActivityResult(
@@ -502,6 +619,13 @@ private fun SettingsScreen(
     }
     var localHour by remember(reminder.hour) { mutableIntStateOf(reminder.hour) }
     var localMinute by remember(reminder.minute) { mutableIntStateOf(reminder.minute) }
+    var pendingImportUri by remember { mutableStateOf<Uri?>(null) }
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri -> uri?.let(onExportBackup) }
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> pendingImportUri = uri }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp),
@@ -538,6 +662,26 @@ private fun SettingsScreen(
                                 Text(option.label, style = MaterialTheme.typography.labelSmall)
                             }
                         }
+                    }
+                }
+            }
+        }
+        item {
+            Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp)) {
+                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Private backup", fontWeight = FontWeight.SemiBold)
+                    Text("Save an unencrypted file containing your progress, notes, settings, and saved passages. Keep it somewhere private.")
+                    OutlinedButton(
+                        onClick = {
+                            exportLauncher.launch("from-grace-to-grace-backup-${LocalDate.now()}.json")
+                        },
+                    ) { Text("Export backup") }
+                    TextButton(onClick = { importLauncher.launch(arrayOf("application/json", "text/plain")) }) {
+                        Text("Restore from backup")
+                    }
+                    backupStatus?.let { message ->
+                        Text(message, color = MaterialTheme.colorScheme.primary)
+                        TextButton(onClick = onClearBackupStatus) { Text("Dismiss") }
                     }
                 }
             }
@@ -583,9 +727,10 @@ private fun SettingsScreen(
                         Switch(
                             checked = goalSettings.notificationsEnabled,
                             onCheckedChange = { enabled ->
-                                if (enabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                                    ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
-                                    PackageManager.PERMISSION_GRANTED
+                                if (
+                                    enabled && (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) &&
+                                    (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+                                    PackageManager.PERMISSION_GRANTED)
                                 ) {
                                     goalPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                                 } else {
@@ -612,9 +757,10 @@ private fun SettingsScreen(
                         Switch(
                             checked = reminder.enabled,
                             onCheckedChange = { enabled ->
-                                if (enabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                                    ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
-                                    PackageManager.PERMISSION_GRANTED
+                                if (
+                                    enabled && (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) &&
+                                    (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+                                    PackageManager.PERMISSION_GRANTED)
                                 ) {
                                     reminderPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                                 } else {
@@ -648,16 +794,35 @@ private fun SettingsScreen(
             Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp)) {
                 Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Local by design", fontWeight = FontWeight.SemiBold)
-                    Text("Steady has no account, advertising, or analytics. Internet access is used only for the daily scripture; recovery notes and progress stay in private app storage and are excluded from backup and device transfer.")
+                    Text("From Grace to Grace has no account, advertising, or analytics. Internet access is used only for the daily scripture and weekly motivational quote refresh. Recovery notes and progress stay in private app storage and are excluded from automatic backup and device transfer; a manual export goes only to the location you choose.")
                 }
             }
         }
         item {
             Text(
-                "Steady is a personal reflection and habit-support tool. It is not medical care or an emergency service.",
+                "From Grace to Grace is a personal reflection and habit-support tool. It is not medical care or an emergency service.",
                 style = MaterialTheme.typography.bodySmall,
             )
         }
+    }
+
+    pendingImportUri?.let { uri ->
+        AlertDialog(
+            onDismissRequest = { pendingImportUri = null },
+            title = { Text("Replace current local data?") },
+            text = { Text("Restoring will replace the current start, history, notes, goals, reminder, theme, and saved passages on this phone.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onImportBackup(uri)
+                        pendingImportUri = null
+                    },
+                ) { Text("Restore backup") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingImportUri = null }) { Text("Cancel") }
+            },
+        )
     }
 }
 
@@ -672,7 +837,7 @@ private fun formatTime(hour: Int, minute: Int): String {
 }
 
 private fun android.content.Context.openUrl(url: String) {
-    runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+    runCatching { startActivity(Intent(Intent.ACTION_VIEW, url.toUri())) }
 }
 
 private fun showStartDateTimePicker(
@@ -714,3 +879,13 @@ private fun showStartDateTimePicker(
 
 private const val ARP_URL =
     "https://www.churchofjesuschrist.org/study/manual/addiction-recovery-program-a-guide-to-addiction-recovery-and-healing"
+private const val ZEN_QUOTES_URL = "https://zenquotes.io/"
+
+private val CURATED_QUOTES = listOf(
+    MotivationalQuote("By small and simple things are great things brought to pass.", "Alma 37:6"),
+    MotivationalQuote("My grace is sufficient for all men that humble themselves before me.", "Ether 12:27"),
+    MotivationalQuote("Look unto me in every thought; doubt not, fear not.", "Doctrine and Covenants 6:36"),
+    MotivationalQuote("Be still, and know that I am God.", "Psalm 46:10"),
+    MotivationalQuote("Come unto me, all ye that labour and are heavy laden, and I will give you rest.", "Matthew 11:28"),
+    MotivationalQuote("Press forward with a steadfastness in Christ, having a perfect brightness of hope.", "2 Nephi 31:20"),
+)

@@ -14,6 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Steady"
+rootProject.name = "FromGraceToGrace"
 include(":app")
-

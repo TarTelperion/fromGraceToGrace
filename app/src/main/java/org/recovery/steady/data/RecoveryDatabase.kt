@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import androidx.core.database.sqlite.transaction
 import java.time.ZoneId
 
 class RecoveryDatabase(context: Context) :
@@ -80,9 +81,8 @@ class RecoveryDatabase(context: Context) :
 
     fun recordLapse(note: String, occurredAtMillis: Long = System.currentTimeMillis()) {
         val state = currentState()
-        writableDatabase.beginTransaction()
-        try {
-            writableDatabase.insertOrThrow(
+        writableDatabase.transaction {
+            insertOrThrow(
                 "lapse_record",
                 null,
                 ContentValues().apply {
@@ -91,7 +91,7 @@ class RecoveryDatabase(context: Context) :
                     put("note", note.trim())
                 },
             )
-            writableDatabase.update(
+            update(
                 "recovery_state",
                 ContentValues().apply {
                     put("started_at", occurredAtMillis)
@@ -100,9 +100,6 @@ class RecoveryDatabase(context: Context) :
                 "id = 1",
                 null,
             )
-            writableDatabase.setTransactionSuccessful()
-        } finally {
-            writableDatabase.endTransaction()
         }
     }
 
@@ -131,11 +128,10 @@ class RecoveryDatabase(context: Context) :
             if (cursor.moveToFirst()) cursor.getLong(0) to cursor.getLong(1) else null
         } ?: return
 
-        writableDatabase.beginTransaction()
-        try {
+        writableDatabase.transaction {
             val current = currentState()
             if (current.startedAtMillis == record.second) {
-                writableDatabase.update(
+                update(
                     "recovery_state",
                     ContentValues().apply {
                         put("started_at", record.first)
@@ -145,10 +141,7 @@ class RecoveryDatabase(context: Context) :
                     null,
                 )
             }
-            writableDatabase.delete("lapse_record", "id = ?", arrayOf(id.toString()))
-            writableDatabase.setTransactionSuccessful()
-        } finally {
-            writableDatabase.endTransaction()
+            delete("lapse_record", "id = ?", arrayOf(id.toString()))
         }
     }
 
@@ -180,7 +173,19 @@ class RecoveryDatabase(context: Context) :
     fun saveSharedResource(text: String) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
-        val url = URL_REGEX.find(trimmed)?.value
+        val alreadySaved = readableDatabase.query(
+            "saved_resource",
+            arrayOf("id"),
+            "body = ?",
+            arrayOf(trimmed),
+            null,
+            null,
+            null,
+            "1",
+        ).use { it.moveToFirst() }
+        if (alreadySaved) return
+
+        val url = URL_REGEX.find(trimmed)?.value?.trimEnd('.', ',', ';', ':')
         writableDatabase.insertOrThrow(
             "saved_resource",
             null,
@@ -191,6 +196,10 @@ class RecoveryDatabase(context: Context) :
                 put("created_at", System.currentTimeMillis())
             },
         )
+    }
+
+    fun deleteResource(id: Long) {
+        writableDatabase.delete("saved_resource", "id = ?", arrayOf(id.toString()))
     }
 
     fun resources(): List<SavedResource> {
@@ -219,8 +228,51 @@ class RecoveryDatabase(context: Context) :
         }
     }
 
+    fun replaceAll(backup: AppBackup) {
+        writableDatabase.transaction {
+            delete("lapse_record", null, null)
+            delete("saved_resource", null, null)
+            delete("recovery_state", null, null)
+
+            insertOrThrow(
+                "recovery_state",
+                null,
+                ContentValues().apply {
+                    put("id", 1)
+                    put("started_at", backup.recovery.startedAtMillis)
+                    put("original_zone", backup.recovery.originalZoneId)
+                },
+            )
+            backup.lapses.forEach { lapse ->
+                insertOrThrow(
+                    "lapse_record",
+                    null,
+                    ContentValues().apply {
+                        put("id", lapse.id)
+                        put("prior_start", lapse.priorStartMillis)
+                        put("occurred_at", lapse.occurredAtMillis)
+                        put("note", lapse.note)
+                    },
+                )
+            }
+            backup.resources.forEach { resource ->
+                insertOrThrow(
+                    "saved_resource",
+                    null,
+                    ContentValues().apply {
+                        put("id", resource.id)
+                        put("title", resource.title)
+                        put("body", resource.body)
+                        put("source_url", resource.sourceUrl)
+                        put("created_at", resource.createdAtMillis)
+                    },
+                )
+            }
+        }
+    }
+
     companion object {
         private const val DATABASE_VERSION = 1
-        private val URL_REGEX = Regex("https?://\\S+")
+        private val URL_REGEX = Regex("https?://[^\\s)\\]}>]+")
     }
 }

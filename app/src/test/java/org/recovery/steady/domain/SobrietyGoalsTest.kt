@@ -21,7 +21,7 @@ class SobrietyGoalsTest {
     fun progressMovesFromLastCompletedGoalToNextGoal() {
         val hour = SobrietyGoal.ONE_HOUR.durationMillis
         val day = SobrietyGoal.ONE_DAY.durationMillis
-        val halfway = hour + (day - hour) / 2
+        val halfway = hour + ((day - hour) / 2)
         val progress = calculateGoalProgress(
             startedAtMillis = 0L,
             nowMillis = halfway,

@@ -1,6 +1,5 @@
 <resources>
-    <string name="app_name">Steady</string>
+    <string name="app_name">From Grace to Grace</string>
     <string name="notification_channel_name">Gentle reminders</string>
     <string name="notification_channel_description">Private reminders to pause and reconnect</string>
 </resources>
-

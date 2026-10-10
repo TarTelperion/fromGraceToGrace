@@ -41,7 +41,10 @@ class DailyScriptureWorker(
     params: WorkerParameters,
 ) : CoroutineWorker(appContext, params) {
     override suspend fun doWork(): Result {
-        RecoveryRepository(applicationContext).refreshDailyScriptureIfNeeded()
+        RecoveryRepository(applicationContext).apply {
+            refreshDailyScriptureIfNeeded()
+            refreshMotivationalQuotesIfNeeded()
+        }
         return Result.success()
     }
 }
